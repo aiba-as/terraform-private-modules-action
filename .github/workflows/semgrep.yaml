@@ -1,0 +1,103 @@
+# SAST scanning with Semgrep, based on:
+# https://github.com/j3ssie/sample-semgrep-ci
+#
+# Rolled out org-wide per ATP-3730 (Secureframe SA-1-6: no pre-merge SAST
+# gate exists in any of the six ISO27001/SOC2-in-scope repos). Same
+# workflow as https://github.com/aiba-as/tf_asp_infra/pull/692.
+#
+# Phase 1 (this PR): report-only. Findings are uploaded as a build artifact
+# so we can triage false positives before anything blocks a merge.
+#
+# Phase 2 (follow-up, tracked in ATP-3730): once the first batch of findings
+# is triaged, add `--error` to the scan command and register this job
+# (`semgrep/ci`) as a required status check in branch protection. That's
+# what actually closes the Secureframe SA-1-6 gap.
+name: Semgrep
+
+on:
+  # Scan changed files in PRs (diff-aware scanning):
+  pull_request: {}
+  # Scan on-demand through the GitHub Actions interface:
+  workflow_dispatch: {}
+  # Scan mainline branches and report all findings:
+  push:
+    branches: ["main"]
+
+jobs:
+  semgrep_scan:
+    name: semgrep/ci
+    runs-on: ubuntu-latest
+    container:
+      # Official Semgrep image (returntocorp/semgrep was renamed to this).
+      # Pinned to a specific version so a Semgrep release can't silently
+      # change CLI behavior, rule formats, or SARIF output out from under
+      # this pipeline. Bump deliberately, not automatically.
+      image: semgrep/semgrep:1.174.0
+    # Skip PRs opened by dependabot to avoid permission issues.
+    if: (github.actor != 'dependabot[bot]')
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # NOTE: --config auto picks Semgrep Registry rulesets based on the
+      # languages/files it finds (secrets detection, language-specific
+      # rules, etc). No --error flag yet, see "Phase 1" note above: this
+      # never fails the job regardless of findings.
+      - name: Perform Semgrep Analysis
+        run: semgrep scan -q --sarif --config auto . > semgrep-results.sarif
+
+      # Surfaces findings right on the Actions run page (no GitHub Code
+      # Security license needed for this, unlike the Security-tab upload
+      # below). Doesn't gate anything, just makes results visible without
+      # having to download the SARIF artifact.
+      - name: Write scan summary
+        if: always() && hashFiles('semgrep-results.sarif') != ''
+        run: |
+          python3 <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+
+          with open("semgrep-results.sarif") as f:
+              sarif = json.load(f)
+
+          results = sarif.get("runs", [{}])[0].get("results", [])
+          counts = {}
+          rows = []
+          for r in results:
+              level = r.get("level", "warning")
+              counts[level] = counts.get(level, 0) + 1
+              rule = r.get("ruleId", "?")
+              msg = r.get("message", {}).get("text", "").splitlines()[0][:120]
+              loc = (r.get("locations") or [{}])[0].get("physicalLocation", {})
+              path = loc.get("artifactLocation", {}).get("uri", "?")
+              line = loc.get("region", {}).get("startLine", "?")
+              rows.append((path, line, level, rule, msg))
+
+          print("## Semgrep scan results\n")
+          if not results:
+              print("No findings.\n")
+          else:
+              breakdown = ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
+              print(f"**{len(results)} finding(s)**: {breakdown}\n")
+              print("| File | Line | Severity | Rule | Message |")
+              print("|---|---|---|---|---|")
+              for path, line, level, rule, msg in rows[:50]:
+                  print(f"| `{path}` | {line} | {level} | `{rule}` | {msg} |")
+              if len(rows) > 50:
+                  print(f"\n_...and {len(rows) - 50} more. Full results in the `semgrep-scan-results` artifact._")
+          PY
+
+      # NOTE: intentionally NOT uploading to the GitHub Security Dashboard
+      # via github/codeql-action/upload-sarif. That API requires GitHub
+      # Advanced Security, which this org does not have on private repos
+      # (confirmed while investigating ATP-3730 / SA-1-6) — it would fail
+      # on every run for licensing reasons, unrelated to actual findings.
+      # Results are still available below as a downloadable artifact.
+      - name: Save SARIF results as artifact
+        if: always() && hashFiles('semgrep-results.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-scan-results
+          path: semgrep-results.sarif
