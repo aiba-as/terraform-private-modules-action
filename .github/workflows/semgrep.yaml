@@ -3,15 +3,21 @@
 #
 # Rolled out org-wide per ATP-3730 (Secureframe SA-1-6: no pre-merge SAST
 # gate exists in any of the six ISO27001/SOC2-in-scope repos). Same
-# workflow as https://github.com/aiba-as/tf_asp_infra/pull/692.
+# workflow as tf_asp_infra's (aiba-as/tf_asp_infra#692, since fixed by
+# aiba-as/tf_asp_infra#700: the baseline diffing below didn't actually
+# work there until that fix, see the note on the "Trust the checked-out
+# workspace" step).
 #
-# Phase 1 (this PR): report-only. Findings are uploaded as a build artifact
-# so we can triage false positives before anything blocks a merge.
+# Baseline diffing (below) scopes each run to only what's new since a
+# given commit, so existing findings are not re-flagged, only NEW
+# findings introduced by a PR's diff or a push are reported.
 #
-# Phase 2 (follow-up, tracked in ATP-3730): once the first batch of findings
-# is triaged, add `--error` to the scan command and register this job
-# (`semgrep/ci`) as a required status check in branch protection. That's
-# what actually closes the Secureframe SA-1-6 gap.
+# --error: the scan fails the job on any finding *new* since the
+# baseline (the existing backlog doesn't count, see above). This is the
+# gate itself, matching tf_asp_infra (aiba-as/tf_asp_infra, commit
+# c6a67da6). It still needs `semgrep/ci` registered as a required status
+# check in branch protection to actually block a merge, that part isn't
+# done yet (see ATP-3739).
 name: Semgrep
 
 on:
@@ -19,7 +25,7 @@ on:
   pull_request: {}
   # Scan on-demand through the GitHub Actions interface:
   workflow_dispatch: {}
-  # Scan mainline branches and report all findings:
+  # Scan main and report all findings:
   push:
     branches: ["main"]
 
@@ -39,15 +45,55 @@ jobs:
       contents: read
 
     steps:
+      # Full history needed so the baseline commit (PR base, or the
+      # previous commit on a push) is actually available locally for
+      # --baseline-commit to diff against below.
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # actions/checkout runs on the runner host (its own temporary HOME),
+      # not inside the `container:` above, so the safe.directory entry it
+      # sets there is invisible to the container's HOME (/github/home).
+      # Without this, `git cat-file -e` in the next step fails with
+      # "detected dubious ownership" (silenced by its 2>/dev/null), which
+      # would make every push/PR silently fall back to a full-repo scan
+      # instead of a diff against the baseline commit (see
+      # aiba-as/tf_asp_infra#700 for how this was found).
+      - name: Trust the checked-out workspace inside the container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       # NOTE: --config auto picks Semgrep Registry rulesets based on the
       # languages/files it finds (secrets detection, language-specific
-      # rules, etc). No --error flag yet, see "Phase 1" note above: this
-      # never fails the job regardless of findings.
+      # rules, etc). --error makes the scan step (and job) fail if it
+      # reports any finding, see the note at the top of this file. It also
+      # applies to the full-scan fallback: on a workflow_dispatch that's
+      # just a red run in the Actions UI (it's not a required check, so
+      # nothing is blocked), and on push/PR it means a baseline-lookup
+      # regression fails loudly instead of silently going back to
+      # report-only.
+      #
+      # --baseline-commit scopes the scan to only what's new since a
+      # given commit. workflow_dispatch has no PR/push event to diff
+      # against, so it always does a full scan (useful for a periodic
+      # full audit).
       - name: Perform Semgrep Analysis
-        run: semgrep scan -q --sarif --config auto . > semgrep-results.sarif
+        run: |
+          BASELINE=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASELINE="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            BASELINE="${{ github.event.before }}"
+          fi
+
+          if [ -n "$BASELINE" ] && git cat-file -e "$BASELINE" 2>/dev/null; then
+            echo "Baseline commit: $BASELINE (only findings new since then are reported)"
+            semgrep scan -q --error --sarif --config auto --baseline-commit "$BASELINE" . > semgrep-results.sarif
+          else
+            echo "No usable baseline commit (workflow_dispatch, or first push on a new branch) — scanning the full repo"
+            semgrep scan -q --error --sarif --config auto . > semgrep-results.sarif
+          fi
 
       # Surfaces findings right on the Actions run page (no GitHub Code
       # Security license needed for this, unlike the Security-tab upload
@@ -58,9 +104,19 @@ jobs:
         run: |
           python3 <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json
+          import sys
 
-          with open("semgrep-results.sarif") as f:
-              sarif = json.load(f)
+          # semgrep exits non-zero (env/tool failure, not just --error on
+          # findings) leaves this file empty via the step's `>` redirect,
+          # and hashFiles() above only guards a missing file, not an empty
+          # one, so an empty/corrupt SARIF here is a real possibility, not
+          # just defensive paranoia.
+          try:
+              with open("semgrep-results.sarif") as f:
+                  sarif = json.load(f)
+          except (FileNotFoundError, json.JSONDecodeError) as e:
+              print(f"## Semgrep scan results\n\nError reading SARIF file: {e}\n")
+              sys.exit(0)
 
           results = sarif.get("runs", [{}])[0].get("results", [])
           counts = {}
